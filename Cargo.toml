@@ -1,0 +1,29 @@
+[package]
+name = "float_reader"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+egui = "0.35.0"
+epaint = "0.35.0"
+eframe = { version = "0.35", default-features = false, features = [
+    "accesskit",     # Make egui compatible with screen readers. NOTE: adds a lot of dependencies.
+    "default_fonts", # Embed the default egui fonts.
+    "glow",          # Use the glow rendering backend. Alternative: "wgpu".
+    # "persistence",   # Enable restoring app state when restarting the app.
+    "wayland",       # To support Linux (and CI)
+] }
+log = "0.4"
+
+egui_extras = { version = "0.35.0", features = ["all_loaders"] }
+pdfium-render = {version = "0.9.4", features = ["default"]}
+
+serde_json = "1.0"
+serde = {version = "1.0", features = ["derive"]}
+input_egui = { git = "https://github.com/drop-dingdong/input_egui.git"}
+
+image = "0.25.0"
+
+[profile.release]
+opt-level = 2
