@@ -1,10 +1,31 @@
-use egui::{Image, Pos2, Rect, TextureHandle, Vec2, vec2};
+use egui::{Color32, CornerRadius, Image, Pos2, Rect, TextureHandle, Vec2, vec2};
 
 use crate::constant::*;
 use crate::{fit_vec_in_rect, shrink2_but_meaningful};
 
+#[derive(Debug)]
+pub enum ImageShow<'a> {
+    // 因为存在一些条件下对应的图片并没有完全加载，所以以I 和 C来区分两种状况，在未加载或者未有替代texture的情况下，使用color32来替代图片填充对应的区域，当前前提是需要知道图片的具体大小
+    I(Image<'a>),
+    C(Color32),
+}
+impl<'a> ImageShow<'a> {
+    pub fn update_with_texture(&mut self, texture: &TextureHandle, img_uv: Rect) {
+        let img = Image::from_texture(texture).uv(img_uv);
+        *self = ImageShow::I(img);
+    }
+    pub fn paint_at(&self, ui: &mut egui::Ui, rect: Rect) {
+        match self {
+            ImageShow::I(img) => img.paint_at(ui, rect),
+            ImageShow::C(color) => {
+                ui.painter_at(rect)
+                    .rect_filled(rect, CornerRadius::same(0), *color);
+            }
+        }
+    }
+}
 pub struct MultiImage<'a> {
-    pub images: Vec<(Image<'a>, Rect)>, //image, uv
+    pub images: Vec<(ImageShow<'a>, Rect)>, //image, uv
     pub disp_rect: Rect,
 }
 
@@ -12,26 +33,18 @@ impl<'a> MultiImage<'a> {
     pub fn show(&self, ui: &mut egui::Ui) {
         let disp_size = self.disp_rect.size();
         let lt = self.disp_rect.left_top();
-        for (img, uv) in self.images.iter() {
+        for (img_show, uv) in self.images.iter() {
             let uv_size = uv.size();
             let uv_lt = uv.left_top();
             let rect = Rect::from_min_size(lt + uv_lt.to_vec2() * disp_size, uv_size * disp_size);
-            img.paint_at(ui, rect);
+            img_show.paint_at(ui, rect);
         }
     }
 }
 pub trait GetImgInfo {
-    type Loader;
-    fn get_img_number(self: &Self) -> usize;
-    fn get_min_outer_size(self: &Self) -> Vec2;
-    // 下面两个函数有panic风险
-    fn get_img_with_special_scale_or_load(
-        self: &mut Self,
-        pix: usize,
-        disp_scale: f32,
-        loader: &Self::Loader,
-    ) -> &TextureHandle;
-    fn get_img_size(self: &Self, pix: usize) -> Vec2;
+    fn get_img_number(&self) -> usize;
+    fn get_min_outer_size(&self) -> Vec2;
+    fn get_img_size(&self, pix: usize) -> Vec2;
 }
 // 图片矩阵的游标系统
 pub struct Images2DCursor {
@@ -55,6 +68,7 @@ impl Images2DCursor {
         image_array: &impl GetImgInfo,
         center_pos: Vec2,
     ) -> Self {
+        // 一定产生一个符合需求且正确的游标
         let mut res = Self::new(line_num, disp_scale, view_rect, image_array);
         let vec = fit_vec_in_rect(center_pos, res.allowed_rect);
         res.view_center = vec;
@@ -97,8 +111,7 @@ impl Images2DCursor {
     }
     pub fn get_multi_image<'b, T: GetImgInfo>(
         &self,
-        image_array: &mut T,
-        _: &T::Loader,
+        image_array: &T,
     ) -> (Vec<(usize, Rect, Rect)>) {
         let vhspace = self.vhspace / self.disp_scale;
         let img_num = self.img_num;
@@ -139,7 +152,7 @@ impl Images2DCursor {
         }
         related_info
     }
-    pub fn view_center_img_pos(&self, image_array: &mut impl GetImgInfo) -> (usize, Vec2) {
+    pub fn view_center_img_pos(&self, image_array: &impl GetImgInfo) -> (usize, Vec2) {
         let vhspace = self.vhspace / self.disp_scale;
         let unit = self.item_size + Vec2::splat(vhspace);
         let xy_unit = self.view_center / unit;
@@ -160,7 +173,7 @@ impl Images2DCursor {
         &mut self,
         idx: usize,
         vec: Vec2,
-        image_array: &mut impl GetImgInfo,
+        image_array: &impl GetImgInfo,
     ) {
         // vec 为相对于中心的位移矢量，单位为img_size
         // 不允许通过跳动的方式移到outer_rect之外的地方。
@@ -185,7 +198,7 @@ impl Images2DCursor {
         self.view_center = fit_vec_in_rect(view_center, self.allowed_rect);
     }
     // 尽可能保持视觉中心依旧在中心
-    pub fn update_rescale(&mut self, new_scale: f32, img_array: &mut impl GetImgInfo) {
+    pub fn update_rescale(&mut self, new_scale: f32, img_array: &impl GetImgInfo) {
         let view_center_img = self.view_center_img_pos(img_array);
 
         let new_vhspace = self.vhspace / new_scale;

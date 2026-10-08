@@ -1,30 +1,30 @@
+use crate::backend::{BackEnd, DocumentInfo, SpecialPage};
 use crate::constant::*;
-use crate::link::{
-    LinkContent, LinkIndex, SpecialPageLink, get_link_and_target, link_save_strnig,
-    load_from_string,
-};
+use crate::link::{LinkContent, LinkIndex, SpecialPageLink, link_save_strnig};
+use crate::multi_image::{ImageShow, MultiImage};
 use crate::resizeable::{ResizeableRect, SelectZone};
-use crate::view::{Jump, View, ViewAction};
-use crate::{allocate_and_fill, fit_vec_in_rect, painter_richtext, shrink2_but_meaningful};
-
+use crate::view::{Jump, PageRenderInfo, RenderPage, View, ViewAction, get_img_without_scale};
+use crate::{Line, allocate_and_fill, fit_vec_in_rect, painter_richtext, shrink2_but_meaningful};
 use egui::{
-    Button, Color32, CornerRadius, FontId, Image, Key, Modifiers, Pos2, Rect, Response, RichText,
-    Sense, Stroke, TextEdit, Tooltip, Vec2, pos2, vec2,
+    Button, Color32, ColorImage, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, Response,
+    RichText, Sense, Stroke, TextEdit, TextureHandle, Tooltip, Vec2, pos2, vec2,
 };
 use input_egui::{InputState, WarningInput};
-use pdfium_render::prelude::{PdfDocument, Pdfium};
+use pdfium_render::prelude::Pdfium;
+use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use std::collections::HashMap;
-use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::mem;
+use std::{fmt, thread};
 
 #[derive(Debug, Default)]
 enum HoverPreviewState<'a> {
     #[default]
     Empty,
-    Instance(LinkIndex, Rect, (Vec2, Image<'a>)), // page_index inner_index
+    Instance(LinkIndex, Rect, (Vec2, ImageShow<'a>)), // page_index inner_index
     InHash(LinkIndex),
 }
 impl<'a> HoverPreviewState<'a> {
@@ -119,14 +119,19 @@ struct Basic {
     scale: f32,
     disp_rect: Rect,
     read_mode: usize,
+    rs: (
+        Receiver<(PageRenderInfo, [usize; 2], Vec<u8>)>,
+        Sender<SpecialPage>,
+    ),
 }
 impl Basic {
-    fn new() -> Self {
+    fn new(prr: Receiver<(PageRenderInfo, [usize; 2], Vec<u8>)>, cs: Sender<SpecialPage>) -> Self {
         let init_rect = Rect::from_min_max(pos2(0., 30.), pos2(INIT_UI_SIZE[0], INIT_UI_SIZE[1]));
         Self {
             scale: 1.,
             disp_rect: init_rect,
-            read_mode: 0,
+            read_mode: 1,
+            rs: (prr, cs),
         }
     }
     fn show(&mut self, ui: &mut egui::Ui, available_size: Vec2) {
@@ -135,53 +140,77 @@ impl Basic {
             .rect_filled(self.disp_rect, CornerRadius::same(0), Color32::GRAY);
     }
 }
+#[derive(Default)]
 enum ReadPart<'a> {
-    Empty(Basic),
+    #[default]
+    Empty,
+    Basic(Basic),
     Reader(Reader<'a>),
 }
 impl<'a> ReadPart<'a> {
-    fn new() -> Self {
-        ReadPart::Empty(Basic::new())
-    }
-    fn is_empty(&self) -> bool {
+    fn is_changed(&self) -> bool {
         match self {
-            ReadPart::Empty(_) => true,
+            ReadPart::Reader(reader) => reader.changed,
             _ => false,
         }
     }
-    fn is_changed(&self) -> bool {
-        match self {
-            ReadPart::Empty(_) => false,
-            ReadPart::Reader(reader) => reader.changed,
-        }
+    fn update_info(self, ppp: f32, document_info: DocumentInfo) -> Self {
+        let basic = match self {
+            ReadPart::Basic(basic) => basic,
+            ReadPart::Reader(reader) => reader.get_basic(),
+            ReadPart::Empty => panic!(),
+        };
+        ReadPart::Reader(Reader::new_with_document_info(document_info, ppp, basic))
     }
 }
 pub struct MyApp<'a> {
     input: (String, InputState, String), // 输入字符串的buffer，inputstate输入状态，warning信息
-    back_end: &'a Pdfium,
     top_panel_rect: ([Rect; 2], [Rect; READ_TOP_RECT_NUM]),
+    file_path_sender: Sender<String>,
+    file_state_reciver: Receiver<Option<DocumentInfo>>,
+    end_sender: Sender<()>,
     reader: ReadPart<'a>,
 }
+impl<'a> Drop for MyApp<'a> {
+    fn drop(&mut self) {
+        self.end_sender.send(());
+    }
+}
 impl<'a> MyApp<'a> {
-    pub fn new(pdfium: &'a Pdfium) -> Self {
-        let reader = ReadPart::new();
+    pub fn new() -> Self {
+        let (fs, fr) = channel();
+        let (cs, cr) = channel();
+        let (fss, fsr) = channel();
+        let (prs, prr) = channel();
+        let (es, er) = channel();
+        thread::spawn(move || {
+            let root = env!["CARGO_MANIFEST_DIR"];
+            let pdfium = Pdfium::new(
+                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&format!(
+                    "{}/asset",
+                    root
+                )))
+                .unwrap(),
+            );
+            let mut back_end = BackEnd::new(&pdfium, fr, cr, fss, prs, er);
+            back_end.run();
+        });
+        let reader = ReadPart::Basic(Basic::new(prr, cs));
         let input = (String::new(), InputState::Active, String::new());
         Self {
             input,
-            back_end: pdfium,
             reader,
             top_panel_rect: top_panel_rect_calc(),
+            file_path_sender: fs,
+            file_state_reciver: fsr,
+            end_sender: es,
         }
     }
-    pub fn new_with_path(pdfium: &'a Pdfium, path: &String) -> Self {
-        let reader = ReadPart::new();
+    pub fn new_with_path(path: &String) -> Self {
+        let mut app = Self::new();
         let input = (String::from(path), InputState::WaitingVerify, String::new());
-        Self {
-            input,
-            back_end: pdfium,
-            reader,
-            top_panel_rect: top_panel_rect_calc(),
-        }
+        app.input = input;
+        app
     }
     fn top_panel_input(&mut self, ui: &mut egui::Ui) {
         let input_related_rect = &self.top_panel_rect.0;
@@ -205,7 +234,11 @@ impl<'a> MyApp<'a> {
         } else {
             None
         };
-        let re_active = self.input.1.is_inactive() && verify_response.clicked();
+        let reactiveable = match self.input.1 {
+            InputState::WaitingVerify | InputState::InActive => true,
+            _ => false,
+        }; // 这里使用inputstate::verified作为一个中间情况等待子线程响应，在响应期间不能reactive
+        let re_active = reactiveable && verify_response.clicked();
         if re_active {
             self.input.1 = InputState::Active;
             self.input.2.clear();
@@ -241,86 +274,68 @@ impl<'a> MyApp<'a> {
         );
         (rem_size)
     }
-    fn verify_input(&mut self) -> Option<PdfDocument<'a>> {
-        // 在is_waiting的状态下验证输入是否合法
-        // 如果合法则输出读取的pdfdocument，否则会显示警告信息。
-        // 如果输出some，那么inputstate一定inactive
-        if self.input.0.ends_with(".pdf") {
-            match self.back_end.load_pdf_from_file(&self.input.0, None) {
-                Ok(document) => {
+    fn verify_input(&mut self) -> Option<DocumentInfo> {
+        // 判断输入是否合法
+        // 由于现在读取document和主线程不在同一条线程上，所以
+        // 两段式检验，waitingverify的时候，检验是否以pdf后缀为结。后将其置为verified
+        // verified则需要等到消息，如果获取消息，显示读取成功，则跳转到inactive，在waiting verify和inactive阶段都能重新reactive
+        let mut new_document_info = None;
+        match self.input.1 {
+            InputState::Active | InputState::InActive => (),
+            InputState::WaitingVerify => {
+                if self.input.0.ends_with(".pdf") {
+                    self.input.1 = InputState::Verified;
+                    self.file_path_sender.send(self.input.0.clone());
+                } else {
                     self.input.1 = InputState::InActive;
-                    Some(document)
-                }
-                Err(err) => {
-                    self.input.1 = InputState::InActive;
-                    self.input.2.clear();
-                    self.input.2.insert_str(0, &err.to_string());
-                    None
                 }
             }
-        } else {
-            self.input.1 = InputState::InActive;
-            self.input.2.clear();
-            self.input.2.insert_str(0, "input pdf file full path");
-            None
-        }
-    }
-    fn back_empty(&mut self, scale: f32, disp_rect: Rect, read_mode: usize) {
-        self.reader = ReadPart::Empty(Basic {
-            scale,
-            disp_rect,
-            read_mode,
-        })
+            InputState::Verified => {
+                if let Ok(recv) = self.file_state_reciver.try_recv() {
+                    match recv {
+                        None => {
+                            self.input.1 = InputState::InActive;
+                            self.input.2.clear();
+                            self.input.2.insert_str(0, "can not load file");
+                        }
+                        Some(info) => {
+                            self.input.1 = InputState::InActive;
+                            self.input.2.clear();
+                            new_document_info = Some(info);
+                        }
+                    }
+                }
+            }
+        };
+        new_document_info
     }
     fn show(&mut self, ui: &mut egui::Ui) {
         let total_size = ui.available_size();
 
         let (rem_size) = self.top_panel(ui, total_size);
         let dropped_file = ui.input_mut(|i| i.raw.dropped_files.pop());
-        let document = if self.input.1.is_waiting() {
-            self.verify_input()
-        } else if let Some(file) = dropped_file
+        if let Some(file) = dropped_file
             && let Some(path) = file.path
             && let Some(path_str) = path.to_str()
         {
             self.input.0.clear();
             self.input.0.insert_str(0, path_str);
             self.input.1 = InputState::WaitingVerify;
-            self.verify_input()
-        } else {
-            None
+        }
+        let ppp = ui.ctx().pixels_per_point();
+        if let Some(document_info) = self.verify_input() {
+            let reader = mem::take(&mut self.reader);
+            self.reader = reader.update_info(ppp, document_info);
         };
         match &mut self.reader {
-            ReadPart::Empty(basis) => {
-                basis.show(ui, rem_size);
-                if let Some(document) = document {
-                    self.reader = ReadPart::Reader(Reader::new_with_document(
-                        document,
-                        basis.scale,
-                        basis.disp_rect,
-                        basis.read_mode,
-                        &self.input.0,
-                    ));
-                }
-            }
+            ReadPart::Basic(basis) => basis.show(ui, rem_size),
             ReadPart::Reader(reader) => {
                 let action = reader.top_panel_button(ui, self.top_panel_rect.1);
                 let view_action = reader.view_action.take();
                 reader.view_action = view_action.or(action);
                 reader.show(ui, rem_size);
-                if let Some(document) = document {
-                    let scale = reader.viewer.disp_scale;
-                    let disp_rect = reader.viewer.disp_rect;
-                    let read_mode = reader.viewer.line_num;
-                    self.reader = ReadPart::Reader(Reader::new_with_document(
-                        document,
-                        scale,
-                        disp_rect,
-                        read_mode,
-                        &self.input.0,
-                    ));
-                }
             }
+            ReadPart::Empty => panic!(),
         }
     }
 }
@@ -336,154 +351,106 @@ struct CustomFlag {
     page_num_input: bool,
 }
 pub struct Reader<'a> {
-    link_name: String,                    // 保存文件使用的文字
+    link_name: String, // 保存文件使用的文字
+    render_cache: HashMap<usize, RenderPage>,
+    page_size_vec: Rc<Vec<Vec2>>,
     hover_preview: HoverPreviewState<'a>, // 从前向后依次为preview的页码，link码，link的rect， 可持续时间，hw_ratio，image
     // 其中可持续时间是想解决如何很好的控制多点hover的问题。一个hover_preview设定为，如果pointer_pos不处在link_rect上，或者不处在preview上，那么将消失。hover in则重置该量，
-    fixed_preview: HashMap<LinkIndex, (usize, Rect, Image<'a>)>,
+    fixed_preview: HashMap<LinkIndex, (usize, Rect, ImageShow<'a>)>,
     fix_preview_order: Vec<LinkIndex>,
     link: Vec<Vec<SpecialPageLink>>,
     ref_link: Vec<Vec<LinkContent>>,
-    reloaded: bool,
     state: ReaderState,
     view_action: ViewAction,
-    viewer: View<'a>,
+    view: View,
+    cs: Sender<SpecialPage>,
+    prr: Receiver<(PageRenderInfo, [usize; 2], Vec<u8>)>,
+    view_page_info: (usize, Vec<(usize, Rect, Rect)>),
+    require_line: Line<(usize, f32)>,
+    view_img: MultiImage<'a>,
     changed: bool,
     page_str: String,
     custom_flags: CustomFlag,
 }
 impl<'a> Reader<'a> {
-    fn new_with_document(
-        document: PdfDocument<'a>,
-        scale: f32,
-        disp_rect: Rect,
-        read_mode: usize,
-        file_name: &str,
-    ) -> Self {
-        let pages = document.pages();
-        let page_num = pages.len() as usize;
-        let mut link_file_name = String::new();
-        link_file_name.insert_str(0, ".json");
-        link_file_name.insert_str(0, file_name);
-        let (link, ref_link) =
-            match (|| -> Option<(Vec<Vec<SpecialPageLink>>, Vec<Vec<LinkContent>>)> {
-                let mut buf = String::new();
-                let mut file = File::open(&link_file_name).ok()?;
-                file.read_to_string(&mut buf).ok()?;
-                load_from_string(buf.as_str()).ok()
-            })() {
-                None => get_link_and_target(pages),
-                Some(data) => data,
-            };
-        let viewer = View::new(document, disp_rect, scale);
-        let action = match read_mode {
-            1 => ViewAction::Col(1),
-            2 => ViewAction::Col(2),
-            _ => ViewAction::Col(page_num),
-        };
-        Self {
-            link,
-            ref_link,
-            viewer,
-            reloaded: false,
-            state: Default::default(),
-            hover_preview: HoverPreviewState::Empty,
-            fixed_preview: HashMap::new(),
-            fix_preview_order: Vec::new(),
-            view_action: action,
-            changed: false,
-            link_name: link_file_name,
-            custom_flags: Default::default(),
-            page_str: String::new(),
+    fn get_basic(self) -> Basic {
+        let view = &self.view;
+        Basic {
+            disp_rect: view.disp_rect,
+            scale: view.disp_scale,
+            read_mode: view.line_num,
+            rs: (self.prr, self.cs),
         }
     }
-    pub fn new_with_info(
-        scale: f32,
-        disp_rect: Rect,
-        read_mode: usize,
-        file_name: impl Into<String>,
-        back_end: &'a Pdfium,
-    ) -> Option<Self> {
-        let file_name = file_name.into();
-        let link_file_name: String = match file_name.rsplit_once('.') {
-            None => None?,
-            Some((prefix, _)) => Some(prefix.into())?,
-        };
-        let document = back_end.load_pdf_from_file(&file_name, None).ok()?;
-        let pages = document.pages();
-        let page_num = pages.len() as usize;
-        let (link, ref_link) =
-            match (|| -> Option<(Vec<Vec<SpecialPageLink>>, Vec<Vec<LinkContent>>)> {
-                let mut buf = String::new();
-                let mut file = File::open(&link_file_name).ok()?;
-                file.read_to_string(&mut buf).ok()?;
-                load_from_string(buf.as_str()).ok()
-            })() {
-                None => get_link_and_target(pages),
-                Some(data) => data,
-            };
-        let viewer = View::new(document, disp_rect, scale);
-        let action = match read_mode {
-            1 => ViewAction::Col(1),
-            2 => ViewAction::Col(2),
-            _ => ViewAction::Col(page_num),
-        };
-        Some(Self {
-            link,
-            ref_link,
-            viewer,
-            reloaded: false,
-            state: Default::default(),
-            hover_preview: HoverPreviewState::Empty,
-            fixed_preview: HashMap::new(),
-            fix_preview_order: Vec::new(),
-            view_action: action,
-            changed: false,
-            link_name: link_file_name,
-            custom_flags: Default::default(),
-            page_str: String::new(),
-        })
+    fn new_with_document_info(document_info: DocumentInfo, ppp: f32, basic: Basic) -> Self {
+        let pages = document_info.pages;
+        let links = document_info.links;
+        let link_file_name = document_info.link_file_name;
+
+        Self::new(
+            link_file_name,
+            pages.num,
+            pages.min_outer_size,
+            pages.size_vec,
+            basic.disp_rect,
+            ppp,
+            basic.scale,
+            basic.read_mode,
+            links.0,
+            links.1,
+            basic.rs.1,
+            basic.rs.0,
+        )
     }
-    pub fn new(
-        file_name: impl Into<String>,
-        back_end: &'a Pdfium,
-        link_file_name: Option<&String>,
-    ) -> Option<Self> {
-        let document = back_end.load_pdf_from_file(&file_name.into(), None).ok()?;
-        let pages = document.pages();
-        let (link, ref_link) = match link_file_name {
-            None => get_link_and_target(pages),
-            Some(link_file_name) => {
-                match (|| -> Option<(Vec<Vec<SpecialPageLink>>, Vec<Vec<LinkContent>>)> {
-                    let mut buf = String::new();
-                    let mut file = File::open(link_file_name).ok()?;
-                    file.read_to_string(&mut buf).ok()?;
-                    load_from_string(buf.as_str()).ok()
-                })() {
-                    None => get_link_and_target(pages),
-                    Some(data) => data,
-                }
-            }
-        };
-        let viewer = View::new(
-            document,
-            Rect::from_min_max(pos2(0., 0.), pos2(1000., 1000.)),
-            1.,
+    fn new(
+        link_name: String,
+        page_num: usize,
+        min_outer_size: Vec2,
+        page_size_vec: Vec<Vec2>,
+        disp_rect: Rect,
+        ppp: f32,
+        scale: f32,
+        read_mode: usize,
+        link: Vec<Vec<SpecialPageLink>>,
+        ref_link: Vec<Vec<LinkContent>>,
+        cs: Sender<SpecialPage>,
+        prr: Receiver<(PageRenderInfo, [usize; 2], Vec<u8>)>,
+    ) -> Self {
+        let mut render_cache = HashMap::new();
+        let mut require_line = Line::new();
+        let page_size_vec = Rc::new(page_size_vec);
+        let mut view = View::new(
+            page_num,
+            min_outer_size,
+            page_size_vec.clone(),
+            disp_rect,
+            scale,
+            ppp,
         );
-        Some(Self {
-            link,
-            ref_link,
-            viewer,
-            reloaded: false,
-            state: Default::default(),
+        view.update_img_cursor_with_action(ViewAction::Col(read_mode));
+        let view_img = view.get_view_img(&mut render_cache, &mut require_line);
+        let view_page_info = view.view_page_info.clone();
+        Reader {
+            link_name,
+            render_cache: render_cache,
+            page_size_vec,
             hover_preview: HoverPreviewState::Empty,
             fixed_preview: HashMap::new(),
             fix_preview_order: Vec::new(),
-            view_action: ViewAction::Rescale(1.),
+            link,
+            ref_link,
+            state: ReaderState::Read,
+            view_action: ViewAction::Empty,
+            view: view,
+            cs,
+            prr,
+            view_page_info,
+            require_line,
+            view_img,
             changed: false,
-            link_name: String::new(),
-            custom_flags: Default::default(),
             page_str: String::new(),
-        })
+            custom_flags: CustomFlag::default(),
+        }
     }
     fn save_link_info(&mut self) -> Result<(), String> {
         // 将size信息写回linkcentent
@@ -495,32 +462,60 @@ impl<'a> Reader<'a> {
             .map_err(|err| format!("{}", err))?;
         Ok(())
     }
-    fn preview_reload(&mut self, ui: &mut egui::Ui) {
-        // 如果存在某一页因为rescale 重新加载了，那么所有的preview重新获取image
-        for (target_idx, (_, _, img)) in self.fixed_preview.iter_mut() {
-            let ref_link = &self.ref_link[target_idx.page_idx][target_idx.inner_idx];
-            *img = self
-                .viewer
-                .required_clip_content(
-                    target_idx.page_idx,
-                    ref_link.content_rect,
-                    ref_link.disp_size,
-                    ui.ctx(),
-                )
-                .1;
+    fn send_required(&mut self) {
+        let head = self.require_line.pop_head();
+        match head {
+            None => (),
+            Some(head) => {
+                self.cs.send(head).unwrap(); // 假定在view存续期间，总会有接收端
+            }
+        }
+    }
+    fn update_with_special_page(&mut self, page_idx: usize, texture: &TextureHandle) {
+        // 根据页码标识，更新所有的需求相同page_idx的preview or view_img
+        // 不设计为由self主动查询cache，而是由调用主动传入texture_handle，是为了方便
+        if let Some(idx) = self.view_page_info.1.iter().position(|x| x.0 == page_idx) {
+            let img_uv = self.view_page_info.1[idx].1;
+            self.view_img.images[idx]
+                .0
+                .update_with_texture(texture, img_uv);
+        }
+        for (target_idx, val) in self
+            .fixed_preview
+            .iter_mut()
+            .filter(|(key, _)| key.page_idx == page_idx)
+        {
+            let inner_idx = target_idx.inner_idx;
+            let (min, max) = self.ref_link[page_idx][inner_idx].content_rect;
+            val.2
+                .update_with_texture(texture, Rect::from_min_max(min.to_pos2(), max.to_pos2()));
         }
         match &mut self.hover_preview {
             HoverPreviewState::Instance(target_idx, _, (_, img)) => {
-                let ref_link = &self.ref_link[target_idx.page_idx][target_idx.inner_idx];
-                *img = self
-                    .viewer
-                    .required_clip_content(
-                        target_idx.page_idx,
-                        ref_link.content_rect,
-                        ref_link.disp_size,
-                        ui.ctx(),
-                    )
-                    .1;
+                let inner_idx = target_idx.inner_idx;
+                let (min, max) = self.ref_link[page_idx][inner_idx].content_rect;
+                img.update_with_texture(texture, Rect::from_min_max(min.to_pos2(), max.to_pos2()));
+            }
+            _ => (),
+        }
+    }
+    fn get_render(&mut self, ctx: &egui::Context) {
+        // 通过prr获取渲染成功的页面的信息，并并加载到context中
+        match self.prr.try_recv() {
+            Ok((render_info, size, img)) => {
+                let texture_handle = ctx.load_texture(
+                    "",
+                    ColorImage::from_rgba_unmultiplied(size, img.as_slice()),
+                    Default::default(),
+                );
+                let pidx = render_info.page_idx;
+                self.update_with_special_page(pidx, &texture_handle);
+                match self.render_cache.get_mut(&render_info.page_idx) {
+                    None => panic!(), // 在发送之前就需要对应的hash至少有内容
+                    Some(img) => {
+                        img.updata_with_texture(texture_handle, render_info);
+                    }
+                };
             }
             _ => (),
         }
@@ -533,7 +528,7 @@ impl<'a> Reader<'a> {
                 Some((_, rect, img)) => {
                     let (size_changed, close_response) = disp_image_in_rect_with_resized(
                         rect,
-                        self.viewer.disp_rect,
+                        self.view.disp_rect,
                         img,
                         ui,
                         Color32::GRAY,
@@ -588,7 +583,7 @@ impl<'a> Reader<'a> {
                 Some((order, rect, image)) => {
                     let (size_changed, close_response) = disp_image_in_rect_with_resized(
                         rect,
-                        self.viewer.disp_rect,
+                        self.view.disp_rect,
                         image,
                         ui,
                         Color32::RED,
@@ -626,12 +621,12 @@ impl<'a> Reader<'a> {
         // 其次是target的情况，
         let mut view_action = ViewAction::Empty;
         let mut hover = None;
-        let view_page_info = &self.viewer.view_page_info;
-        let disp_rect = self.viewer.disp_rect;
+        let view_page_info = &self.view_page_info;
+        let disp_rect = self.view.disp_rect;
         let disp_lt = disp_rect.left_top();
         let disp_size = disp_rect.size();
         let painter = ui.painter_at(disp_rect);
-        for (idx, (pidx, img_uv, pos_uv)) in view_page_info.iter().enumerate() {
+        for (idx, (pidx, img_uv, pos_uv)) in view_page_info.1.iter().enumerate() {
             // img_uv 显示的图像占据原图像的uv
             // pos_uv 该图像显示区域占据总显示区域的uv
             let pos_uv_lt = pos_uv.left_top().to_vec2();
@@ -710,14 +705,21 @@ impl<'a> Reader<'a> {
                 _ => match self.fixed_preview.get(&target_idx) {
                     None => {
                         let ref_link = &self.ref_link[page_idx][inner_idx];
-                        let new_hover_preview = self.viewer.required_clip_content(
+                        let (min, max) = ref_link.content_rect;
+                        let img_uv = Rect::from_min_max(min.to_pos2(), max.to_pos2());
+                        let new_hover_preview = get_img_without_scale(
                             page_idx,
-                            ref_link.content_rect,
-                            ref_link.disp_size,
-                            ui.ctx(),
+                            self.page_size_vec[page_idx],
+                            img_uv,
+                            ui.ctx().pixels_per_point(),
+                            &mut self.render_cache,
+                            &mut self.require_line,
                         );
-                        self.hover_preview =
-                            HoverPreviewState::Instance(target_idx, hover_rect, new_hover_preview);
+                        self.hover_preview = HoverPreviewState::Instance(
+                            target_idx,
+                            hover_rect,
+                            (ref_link.disp_size, new_hover_preview),
+                        );
                     }
                     Some(_) => {
                         self.hover_preview = HoverPreviewState::InHash(target_idx);
@@ -792,8 +794,8 @@ impl<'a> Reader<'a> {
                     }
                     _ => {
                         self.page_str.clear();
-                        let page_idx = self.viewer.page_info.0;
-                        let page_count = self.viewer.page_num;
+                        let page_idx = self.view.view_center_info.1.0;
+                        let page_count = self.view.all_page_size_info.page_num;
                         fmt::write(
                             &mut self.page_str,
                             format_args!("{}/{}", (page_idx + 1).min(page_count), page_count),
@@ -813,8 +815,8 @@ impl<'a> Reader<'a> {
             let response = ui.allocate_rect(page_text_rect, Sense::click());
             if response.double_clicked() {
                 self.page_str.clear();
-                let page_idx = self.viewer.page_info.0;
-                let page_count = self.viewer.page_num;
+                let page_idx = self.view.view_center_info.1.0;
+                let page_count = self.view.all_page_size_info.page_num;
                 fmt::write(
                     &mut self.page_str,
                     format_args!("{}", (page_idx + 1).min(page_count)),
@@ -834,7 +836,7 @@ impl<'a> Reader<'a> {
         painter_richtext(
             ui.painter_at(scale_text_rect),
             scale_text_rect,
-            RichText::new(format!("{:.1}%", self.viewer.disp_scale * 100.))
+            RichText::new(format!("{:.1}%", self.view.disp_scale * 100.))
                 .background_color(Color32::WHITE),
             egui::FontSelection::Default,
             Color32::BLACK,
@@ -862,23 +864,23 @@ impl<'a> Reader<'a> {
         if left_response.clicked() {
             // let (page_idx, center_pos) = self.viewer.page_info;
             // action = action.or(ViewAction::Jump(page_idx.max(1) - 1, center_pos));
-            let (page_idx, _) = self.viewer.page_info;
+            let (page_idx, _) = self.view.view_center_info.1;
             action = action.or(ViewAction::Jump(page_idx.max(1) - 1, Jump::Footer));
         }
         if right_response.clicked() {
-            let (page_idx, _) = self.viewer.page_info;
-            let max_page_idx = self.viewer.max_page_index();
+            let (page_idx, _) = self.view.view_center_info.1;
+            let max_page_idx = self.view.max_page_index();
             action = action.or(ViewAction::Jump(
                 (page_idx + 1).min(max_page_idx),
                 Jump::Header,
             ));
         }
         if larger_response.clicked() {
-            let disp_scale = self.viewer.disp_scale;
+            let disp_scale = self.view.disp_scale;
             action = action.or(ViewAction::Rescale((disp_scale * 1.25).max(MIN_SCALE)));
         }
         if reduce_response.clicked() {
-            let disp_scale = self.viewer.disp_scale;
+            let disp_scale = self.view.disp_scale;
             action = action.or(ViewAction::Rescale((disp_scale * 0.8).max(MIN_SCALE)));
         }
         if single_response.clicked() {
@@ -888,7 +890,7 @@ impl<'a> Reader<'a> {
             action = action.or(ViewAction::Col(2));
         }
         if single_line_response.clicked() {
-            action = action.or(ViewAction::Col(self.viewer.page_num));
+            action = action.or(ViewAction::Col(self.view.all_page_size_info.page_num));
         }
         if save_response.clicked() {
             match self.save_link_info() {
@@ -904,7 +906,12 @@ impl<'a> Reader<'a> {
         action
     }
     fn show(&mut self, ui: &mut egui::Ui, available_size: Vec2) {
-        let disp_rect = self.viewer.disp_rect;
+        // println!("render_cache {:#?}", self.render_cache);
+        println!("view img info {:#?}", self.view_page_info);
+        // println!("view img {:#?}", self.view_img.images);
+        self.send_required();
+        self.get_render(ui.ctx());
+        let disp_rect = self.view.disp_rect;
         let mut old_action = self.view_action.take();
         if disp_rect.size() != available_size {
             old_action = old_action.or(ViewAction::ReSize(available_size));
@@ -915,23 +922,30 @@ impl<'a> Reader<'a> {
 
         // 主视图绘制
         let pos_change = !old_action.is_empty();
-        let reload = self.viewer.show_with_action(old_action, ui);
+        self.view.update_img_cursor_with_action(old_action);
+        if self.view.view_page_info.0 != self.view_page_info.0 {
+            self.view_page_info = self.view.view_page_info.clone();
+            self.view_img = self
+                .view
+                .get_view_img(&mut self.render_cache, &mut self.require_line);
+        }
+        self.view_img.show(ui);
         if pos_change && !self.custom_flags.page_num_input {
             self.page_str.clear();
-            let page_idx = self.viewer.page_info.0;
-            let page_count = self.viewer.page_num;
+            let page_idx = self.view.view_center_info.1.0;
+            let page_count = self.view.all_page_size_info.page_num;
             fmt::write(
                 &mut self.page_str,
                 format_args!("{}/{}", (page_idx + 1).min(page_count), page_count),
             );
         }
-        self.reloaded |= reload;
+        // self.reloaded |= reload;
 
         let mut action = ViewAction::Empty;
 
         let mut detected_hover = true;
         // 主视图动作捕捉
-        let disp_response = ui.allocate_rect(self.viewer.disp_rect, Sense::drag());
+        let disp_response = ui.allocate_rect(self.view.disp_rect, Sense::drag());
         if disp_response.dragged() {
             action = action.or(ViewAction::Shift(disp_response.drag_delta() * -1.));
             detected_hover &= false;
@@ -941,7 +955,7 @@ impl<'a> Reader<'a> {
             let scroll = ui.input(|i| i.smooth_scroll_delta());
             if zoom_delta != 1.0 {
                 detected_hover &= false;
-                ViewAction::Rescale((self.viewer.disp_scale * zoom_delta).max(MIN_SCALE))
+                ViewAction::Rescale((self.view.disp_scale * zoom_delta).max(MIN_SCALE))
             } else if scroll != Vec2::ZERO {
                 detected_hover &= false;
                 ViewAction::Shift(if self.custom_flags.horizontal_scrolling {
@@ -954,15 +968,9 @@ impl<'a> Reader<'a> {
             }
         });
 
-        // 重新加载preview
-        if self.reloaded {
-            self.preview_reload(ui);
-            self.reloaded = false;
-        }
-
         match &mut self.state {
             ReaderState::Read => {
-                if self.viewer.disp_scale > 0.5 {
+                if self.view.disp_scale > 0.5 {
                     action = action.or(self.disp_link(ui, detected_hover));
                     self.disp_preview(ui);
                 }
@@ -974,8 +982,8 @@ impl<'a> Reader<'a> {
                     if i.key_pressed(Key::Enter) {
                         i.consume_key(Modifiers::NONE, Key::Enter);
                         let ((idx, iidx), (min, max)) = self.state.back2read();
-                        let ith_view_page_info = &self.viewer.view_page_info[idx];
-                        let disp_size = self.viewer.disp_rect.size();
+                        let ith_view_page_info = &self.view_page_info.1[idx];
+                        let disp_size = self.view.disp_rect.size();
                         // 从屏幕坐标变为对应页的uv坐标，
                         let mut min_screen_uv = min / disp_size;
                         let mut max_screen_uv = max / disp_size;
@@ -1008,7 +1016,7 @@ impl<'a> eframe::App for Reader<'a> {
 fn disp_image_in_rect_with_resized(
     rect: &mut Rect,
     max_rect: Rect,
-    image: &mut Image,
+    image: &mut ImageShow,
     ui: &mut egui::Ui,
     edge_color: Color32,
     corn_color: Color32,

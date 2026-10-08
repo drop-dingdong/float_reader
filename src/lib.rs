@@ -1,3 +1,4 @@
+mod backend;
 mod bookmark;
 pub mod constant;
 mod link;
@@ -5,6 +6,8 @@ pub mod multi_image;
 pub mod reader;
 mod resizeable;
 mod view;
+
+use std::sync::mpsc::Receiver;
 
 use egui::{
     Align, Align2, Color32, CornerRadius, FontSelection, Painter, Rect, Response, RichText, Sense,
@@ -58,4 +61,37 @@ fn shrink2_but_meaningful(rect: Rect, vec: Vec2) -> Rect {
     let center = rect.center();
     let size = (rect.size() - 2. * vec).max(Vec2::ZERO);
     Rect::from_center_size(center, size)
+}
+struct Line<T> {
+    vec0: Vec<T>,
+    vec1: Vec<T>,
+}
+impl<T> Line<T> {
+    pub fn new() -> Self {
+        Self {
+            vec0: Default::default(),
+            vec1: Default::default(),
+        }
+    }
+    pub fn clear(&mut self) {
+        self.vec0.clear();
+        self.vec1.clear();
+    }
+    pub fn insert(&mut self, item: T) {
+        self.vec1.push(item);
+    }
+    pub fn pop_head(&mut self) -> Option<T> {
+        if self.vec0.is_empty() && self.vec1.is_empty() {
+            None
+        } else {
+            if self.vec0.is_empty() {
+                while let Some(item) = self.vec1.pop() {
+                    self.vec0.push(item);
+                }
+                self.vec0.pop()
+            } else {
+                self.vec0.pop()
+            }
+        }
+    }
 }

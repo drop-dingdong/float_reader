@@ -1,4 +1,4 @@
-use float_reader::multi_image::{GetImgInfo, Images2DCursor, MultiImage};
+use float_reader::multi_image::{GetImgInfo, ImageShow, Images2DCursor, MultiImage};
 use std::vec::Vec;
 fn main() {
     let options = eframe::NativeOptions {
@@ -20,20 +20,11 @@ struct ImgArray {
     vec: Rc<Vec<(TextureHandle, Vec2)>>,
 }
 impl GetImgInfo for ImgArray {
-    type Loader = ();
     fn get_img_number(self: &Self) -> usize {
         self.vec.len()
     }
     fn get_img_size(self: &Self, pix: usize) -> Vec2 {
         self.vec[pix].1
-    }
-    fn get_img_with_special_scale_or_load(
-        self: &mut Self,
-        pix: usize,
-        _: f32,
-        _: &(),
-    ) -> &TextureHandle {
-        &self.vec[pix].0
     }
     fn get_min_outer_size(self: &Self) -> Vec2 {
         let mut vec = Vec2::ZERO;
@@ -234,16 +225,11 @@ impl<'b> eframe::App for MultiImageTest<'b> {
         }
 
         if change {
-            let related_page_info = img_mat.get_multi_image(&mut self.img_vec, &());
+            let related_page_info = img_mat.get_multi_image(&mut self.img_vec);
             let mut img_array = Vec::with_capacity(related_page_info.len());
             for (pidx, img_uv, pos_uv) in related_page_info.iter() {
-                let img = Image::from_texture(self.img_vec.get_img_with_special_scale_or_load(
-                    *pidx,
-                    self.disp_scale,
-                    &(),
-                ))
-                .uv(*img_uv);
-                img_array.push((img, *pos_uv));
+                let img = Image::from_texture(&self.img_vec.vec[*pidx].0).uv(*img_uv);
+                img_array.push((ImageShow::I(img), *pos_uv));
             }
             self.img_disp = Some(MultiImage {
                 images: img_array,
